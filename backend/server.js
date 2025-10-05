@@ -13,17 +13,18 @@ app.use(express.json());
 
 // Database connection
 const db = mysql.createConnection({
-    host: 'localhost',
-    port: 3307,
-    user: 'root',
-    password: '',
-    database: 'luct_reporting_system'
+    host: process.env.DB_HOST || 'localhost',
+    port: process.env.DB_PORT || 3306,
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || 'password123',
+    database: process.env.DB_NAME || 'luct_reporting_system'
 });
 
+// Connect to database
 db.connect((err) => {
     if (err) {
-        console.error('❌ Database connection failed:', err.stack);
-        return;
+        console.error('❌ Database connection failed:', err);
+        process.exit(1);
     }
     console.log('✅ Connected to MySQL database');
 });
@@ -87,11 +88,38 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+// ------------------- HEALTH CHECK -------------------
+app.get('/api/health', (req, res) => {
+    // Test database connection
+    db.query('SELECT 1 as test', (err) => {
+        const dbStatus = err ? 'DISCONNECTED' : 'CONNECTED';
+        
+        res.json({ 
+            status: 'OK', 
+            message: 'LUCT Reporting System API is running',
+            timestamp: new Date().toISOString(),
+            database: dbStatus,
+            security: {
+                rateLimiting: 'Active',
+                bcrypt: 'Enabled',
+                jwt: 'Active'
+            }
+        });
+    });
+});
+
 // ------------------- SECURE AUTHENTICATION WITH BCRYPT -------------------
 app.post('/api/auth/login', loginLimiter, (req, res) => {
     const { email, password } = req.body;
 
-    console.log('🔑 Login attempt:', { email, ip: req.ip });
+    console.log('🔑 Faculty login attempt:', { email, ip: req.ip });
+
+    if (!email || !password) {
+        return res.status(400).json({
+            success: false,
+            message: 'Email and password are required'
+        });
+    }
 
     const sql = 'SELECT id, name, email, role, faculty, password FROM users WHERE email = ?';
     
@@ -104,74 +132,56 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
             });
         }
         
-        if (results.length > 0) {
-            const user = results[0];
-            
-            try {
-                // Check if password is hashed (bcrypt hashes start with $2)
-                const isHashed = user.password.startsWith('$2');
-                let passwordValid = false;
-                
-                if (isHashed) {
-                    // Compare with bcrypt for hashed passwords
-                    passwordValid = await bcrypt.compare(password, user.password);
-                } else {
-                    // Fallback to plain text comparison (during migration period)
-                    console.log('⚠️  Using plain text password comparison for:', user.email);
-                    passwordValid = password === user.password;
-                    
-                    // Auto-migrate to bcrypt if password is correct
-                    if (passwordValid) {
-                        const hashedPassword = await bcrypt.hash(password, 10);
-                        db.query('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, user.id]);
-                        console.log('✅ Auto-migrated password to bcrypt for:', user.email);
-                    }
-                }
-                
-                if (passwordValid) {
-                    console.log('✅ Login successful for:', user.name);
-                    
-                    const token = jwt.sign(
-                        { 
-                            id: user.id, 
-                            email: user.email, 
-                            role: user.role,
-                            name: user.name 
-                        },
-                        JWT_SECRET,
-                        { expiresIn: '24h' }
-                    );
+        if (results.length === 0) {
+            console.log('❌ User not found:', email);
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid email or password'
+            });
+        }
 
-                    res.json({
-                        success: true,
-                        user: {
-                            id: user.id,
-                            name: user.name,
-                            email: user.email,
-                            role: user.role,
-                            faculty: user.faculty
-                        },
-                        token: token
-                    });
-                } else {
-                    console.log('❌ Password mismatch for:', email);
-                    res.status(401).json({
-                        success: false,
-                        message: 'Invalid email or password'
-                    });
-                }
-            } catch (error) {
-                console.error('❌ Password comparison error:', error);
-                res.status(500).json({
+        const user = results[0];
+        
+        try {
+            const passwordValid = await bcrypt.compare(password, user.password);
+            
+            if (passwordValid) {
+                console.log('✅ Login successful for:', user.name);
+                
+                const token = jwt.sign(
+                    { 
+                        id: user.id, 
+                        email: user.email, 
+                        role: user.role,
+                        name: user.name 
+                    },
+                    JWT_SECRET,
+                    { expiresIn: '24h' }
+                );
+
+                res.json({
+                    success: true,
+                    user: {
+                        id: user.id,
+                        name: user.name,
+                        email: user.email,
+                        role: user.role,
+                        faculty: user.faculty
+                    },
+                    token: token
+                });
+            } else {
+                console.log('❌ Password mismatch for:', email);
+                res.status(401).json({
                     success: false,
-                    message: 'Authentication error'
+                    message: 'Invalid email or password'
                 });
             }
-        } else {
-            console.log('❌ User not found:', email);
-            res.status(401).json({
+        } catch (error) {
+            console.error('❌ Password comparison error:', error);
+            res.status(500).json({
                 success: false,
-                message: 'User not found'
+                message: 'Authentication error'
             });
         }
     });
@@ -182,6 +192,13 @@ app.post('/api/auth/student-login', loginLimiter, (req, res) => {
     const { studentId, password } = req.body;
 
     console.log('🎓 Student login attempt:', { studentId, ip: req.ip });
+
+    if (!studentId || !password) {
+        return res.status(400).json({
+            success: false,
+            message: 'Student ID and password are required'
+        });
+    }
 
     const sql = 'SELECT id, name, email, student_id, program, semester, password FROM students WHERE student_id = ?';
     
@@ -194,75 +211,60 @@ app.post('/api/auth/student-login', loginLimiter, (req, res) => {
             });
         }
         
-        if (results.length > 0) {
-            const student = results[0];
-            
-            try {
-                const isHashed = student.password.startsWith('$2');
-                let passwordValid = false;
-                
-                if (isHashed) {
-                    passwordValid = await bcrypt.compare(password, student.password);
-                } else {
-                    console.log('⚠️  Using plain text password comparison for student:', student.student_id);
-                    passwordValid = password === student.password;
-                    
-                    // Auto-migrate to bcrypt
-                    if (passwordValid) {
-                        const hashedPassword = await bcrypt.hash(password, 10);
-                        db.query('UPDATE students SET password = ? WHERE id = ?', [hashedPassword, student.id]);
-                        console.log('✅ Auto-migrated student password to bcrypt for:', student.student_id);
-                    }
-                }
-                
-                if (passwordValid) {
-                    const token = jwt.sign(
-                        { 
-                            id: student.id, 
-                            studentId: student.student_id, 
-                            role: 'student',
-                            name: student.name 
-                        },
-                        JWT_SECRET,
-                        { expiresIn: '24h' }
-                    );
+        if (results.length === 0) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid student ID or password'
+            });
+        }
 
-                    res.json({
-                        success: true,
-                        user: {
-                            id: student.id,
-                            name: student.name,
-                            email: student.email,
-                            studentId: student.student_id,
-                            program: student.program,
-                            semester: student.semester,
-                            role: 'student'
-                        },
-                        token: token
-                    });
-                } else {
-                    res.status(401).json({
-                        success: false,
-                        message: 'Invalid student ID or password'
-                    });
-                }
-            } catch (error) {
-                console.error('❌ Student password comparison error:', error);
-                res.status(500).json({
+        const student = results[0];
+        
+        try {
+            const passwordValid = await bcrypt.compare(password, student.password);
+            
+            if (passwordValid) {
+                const token = jwt.sign(
+                    { 
+                        id: student.id, 
+                        studentId: student.student_id, 
+                        role: 'student',
+                        name: student.name 
+                    },
+                    JWT_SECRET,
+                    { expiresIn: '24h' }
+                );
+
+                res.json({
+                    success: true,
+                    user: {
+                        id: student.id,
+                        name: student.name,
+                        email: student.email,
+                        studentId: student.student_id,
+                        program: student.program,
+                        semester: student.semester,
+                        role: 'student'
+                    },
+                    token: token
+                });
+            } else {
+                res.status(401).json({
                     success: false,
-                    message: 'Authentication error'
+                    message: 'Invalid student ID or password'
                 });
             }
-        } else {
-            res.status(401).json({
+        } catch (error) {
+            console.error('❌ Student password comparison error:', error);
+            res.status(500).json({
                 success: false,
-                message: 'Student not found'
+                message: 'Authentication error'
             });
         }
     });
 });
 
-// ------------------- SECURE QUICK ACCESS ENDPOINT -------------------
+// ------------------- FIXED SECURE QUICK ACCESS ENDPOINT -------------------
 app.post('/api/auth/secure-quick-access', quickAccessLimiter, (req, res) => {
     const { accessCode, userType } = req.body;
     
@@ -272,177 +274,156 @@ app.post('/api/auth/secure-quick-access', quickAccessLimiter, (req, res) => {
     if (!accessCode || accessCode.length !== 6) {
         return res.status(400).json({
             success: false,
-            message: 'Invalid access code format'
+            message: 'Invalid access code format. Must be 6 characters.'
         });
     }
 
-    // Map access codes to demo accounts
-    const demoAccounts = {
-        // Faculty accounts
-        'LECT01': { email: 'ntate.moloi@luct.ac.za', password: 'password123', userType: 'faculty' },
-        'PRL001': { email: 'ntate.mokoena@luct.ac.za', password: 'password123', userType: 'faculty' },
-        'PL001': { email: 'ntate.mohlomi@luct.ac.za', password: 'password123', userType: 'faculty' },
-        
-        // Student accounts
-        'STU001': { studentId: '901017118', password: 'password123', userType: 'student' },
-        'STU002': { studentId: '901017119', password: 'password123', userType: 'student' },
-        'STU003': { studentId: '901017120', password: 'password123', userType: 'student' },
-        'STU004': { studentId: '901017121', password: 'password123', userType: 'student' }
+    // Map access codes to actual student IDs and faculty emails
+    const accessMap = {
+        'STU001': '901017118',
+        'STU002': '901017119', 
+        'STU003': '901017120',
+        'STU004': '901017121',
+        'LECT01': 'ntate.moloi@luct.ac.za',
+        'PRL001': 'ntate.mokoena@luct.ac.za',
+        'PL001': 'ntate.mohlomi@luct.ac.za'
     };
 
-    const account = demoAccounts[accessCode.toUpperCase()];
+    const lookupValue = accessMap[accessCode.toUpperCase()];
     
-    if (!account) {
-        console.log('❌ Invalid access code attempt:', accessCode);
+    if (!lookupValue) {
+        console.log('❌ Invalid access code:', accessCode);
         return res.status(401).json({
             success: false,
             message: 'Invalid access code'
         });
     }
 
-    // Use existing login logic but with enhanced security
-    const endpoint = account.userType === 'student' 
-        ? '/api/auth/student-login' 
-        : '/api/auth/login';
+    console.log('✅ Access code mapped:', accessCode, '->', lookupValue);
+
+    // Determine if it's a student or faculty
+    const isStudent = accessCode.toUpperCase().startsWith('STU');
     
-    const body = account.userType === 'student'
-        ? { studentId: account.studentId, password: account.password }
-        : { email: account.email, password: account.password };
-
-    // Make internal request to login endpoint
-    const internalRequest = {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'X-Internal-Request': 'true'
-        },
-        body: JSON.stringify(body)
-    };
-
-    // Simulate internal API call (in real implementation, you'd call the route directly)
-    const processLogin = () => {
-        return new Promise((resolve) => {
-            if (account.userType === 'student') {
-                const sql = 'SELECT id, name, email, student_id, program, semester, password FROM students WHERE student_id = ?';
-                db.query(sql, [account.studentId], async (err, results) => {
-                    if (err || results.length === 0) {
-                        resolve({ success: false });
-                        return;
-                    }
-                    
-                    const student = results[0];
-                    const passwordValid = await bcrypt.compare(account.password, student.password);
-                    
-                    if (passwordValid) {
-                        const token = jwt.sign(
-                            { 
-                                id: student.id, 
-                                studentId: student.student_id, 
-                                role: 'student',
-                                name: student.name 
-                            },
-                            JWT_SECRET,
-                            { expiresIn: '24h' }
-                        );
-                        
-                        resolve({
-                            success: true,
-                            user: {
-                                id: student.id,
-                                name: student.name,
-                                email: student.email,
-                                studentId: student.student_id,
-                                program: student.program,
-                                semester: student.semester,
-                                role: 'student'
-                            },
-                            token: token
-                        });
-                    } else {
-                        resolve({ success: false });
-                    }
-                });
-            } else {
-                const sql = 'SELECT id, name, email, role, faculty, password FROM users WHERE email = ?';
-                db.query(sql, [account.email], async (err, results) => {
-                    if (err || results.length === 0) {
-                        resolve({ success: false });
-                        return;
-                    }
-                    
-                    const user = results[0];
-                    const passwordValid = await bcrypt.compare(account.password, user.password);
-                    
-                    if (passwordValid) {
-                        const token = jwt.sign(
-                            { 
-                                id: user.id, 
-                                email: user.email, 
-                                role: user.role,
-                                name: user.name 
-                            },
-                            JWT_SECRET,
-                            { expiresIn: '24h' }
-                        );
-                        
-                        resolve({
-                            success: true,
-                            user: {
-                                id: user.id,
-                                name: user.name,
-                                email: user.email,
-                                role: user.role,
-                                faculty: user.faculty
-                            },
-                            token: token
-                        });
-                    } else {
-                        resolve({ success: false });
-                    }
-                });
-            }
-        });
-    };
-
-    processLogin()
-        .then(data => {
-            if (data.success) {
-                console.log('✅ Secure quick access successful for:', accessCode);
-                
-                // Log the access for security monitoring
-                const securityLog = {
-                    type: 'QUICK_ACCESS',
-                    accessCode: accessCode,
-                    userType: account.userType,
-                    ip: req.ip,
-                    userAgent: req.get('User-Agent'),
-                    timestamp: new Date().toISOString(),
-                    success: true
-                };
-                
-                console.log('🔒 Security Log:', securityLog);
-                
-                res.json({
-                    success: true,
-                    user: data.user,
-                    token: data.token,
-                    message: 'Secure access granted'
-                });
-            } else {
-                console.log('❌ Quick access failed for:', accessCode);
-                res.status(401).json({
+    if (isStudent) {
+        // Lookup student by student_id
+        const sql = 'SELECT id, name, email, student_id, program, semester FROM students WHERE student_id = ?';
+        
+        db.query(sql, [lookupValue], (err, results) => {
+            if (err) {
+                console.error('❌ Student lookup error:', err);
+                return res.status(500).json({
                     success: false,
-                    message: 'Quick access failed - invalid credentials'
+                    message: 'Security service unavailable. Please try again.'
                 });
             }
-        })
-        .catch(error => {
-            console.error('❌ Quick access error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Quick access service unavailable'
+
+            if (results.length === 0) {
+                console.log('❌ Student not found with ID:', lookupValue);
+                return res.status(401).json({
+                    success: false,
+                    message: 'Student account not found'
+                });
+            }
+
+            const student = results[0];
+            console.log('✅ Student found for quick access:', student.name);
+
+            // Generate JWT token for student
+            const token = jwt.sign(
+                { 
+                    id: student.id, 
+                    studentId: student.student_id, 
+                    role: 'student',
+                    name: student.name 
+                },
+                JWT_SECRET,
+                { expiresIn: '24h' }
+            );
+
+            // Security log
+            console.log('🔒 Security Log - Student Access:', {
+                accessCode: accessCode,
+                studentId: student.student_id,
+                ip: req.ip,
+                timestamp: new Date().toISOString(),
+                success: true
+            });
+
+            res.json({
+                success: true,
+                user: {
+                    id: student.id,
+                    name: student.name,
+                    email: student.email,
+                    studentId: student.student_id,
+                    program: student.program,
+                    semester: student.semester,
+                    role: 'student'
+                },
+                token: token,
+                message: 'Secure student access granted'
             });
         });
+    } else {
+        // Lookup faculty by email
+        const sql = 'SELECT id, name, email, role, faculty FROM users WHERE email = ?';
+        
+        db.query(sql, [lookupValue], (err, results) => {
+            if (err) {
+                console.error('❌ Faculty lookup error:', err);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Security service unavailable. Please try again.'
+                });
+            }
+
+            if (results.length === 0) {
+                console.log('❌ Faculty not found with email:', lookupValue);
+                return res.status(401).json({
+                    success: false,
+                    message: 'Faculty account not found'
+                });
+            }
+
+            const user = results[0];
+            console.log('✅ Faculty found for quick access:', user.name);
+
+            // Generate JWT token for faculty
+            const token = jwt.sign(
+                { 
+                    id: user.id, 
+                    email: user.email, 
+                    role: user.role,
+                    name: user.name 
+                },
+                JWT_SECRET,
+                { expiresIn: '24h' }
+            );
+
+            // Security log
+            console.log('🔒 Security Log - Faculty Access:', {
+                accessCode: accessCode,
+                email: user.email,
+                role: user.role,
+                ip: req.ip,
+                timestamp: new Date().toISOString(),
+                success: true
+            });
+
+            res.json({
+                success: true,
+                user: {
+                    id: user.id,
+                    name: user.name,
+                    email: user.email,
+                    role: user.role,
+                    faculty: user.faculty
+                },
+                token: token,
+                message: 'Secure faculty access granted'
+            });
+        });
+    }
 });
 
 // ------------------- STUDENT REGISTRATION WITH BCRYPT -------------------
@@ -756,7 +737,7 @@ app.post('/api/reports', authenticateToken, (req, res) => {
         const class_id = classResults[0].id;
         console.log('✅ Found class ID:', class_id);
 
-        // Get total students from course - FIXED: changed to total_registered_students
+        // Get total students from course
         const courseSql = 'SELECT total_registered_students FROM courses WHERE id = ?';
         db.query(courseSql, [course_id], (err, courseResults) => {
             if (err) {
@@ -768,7 +749,6 @@ app.post('/api/reports', authenticateToken, (req, res) => {
                 return res.status(400).json({ error: 'Course not found' });
             }
 
-            // FIXED: Changed from total_students to total_registered_students
             const total_registered_students = courseResults[0]?.total_registered_students || 0;
             console.log('✅ Course found, total students:', total_registered_students);
 
@@ -979,18 +959,53 @@ app.get('/api/users', authenticateToken, (req, res) => {
         res.json(results);
     });
 });
+// ------------------- STUDENT ENROLLMENTS -------------------
+app.get('/api/student/courses', authenticateToken, (req, res) => {
+    if (req.user.role !== 'student') {
+        return res.status(403).json({ error: 'Access denied. Student role required.' });
+    }
 
-// ------------------- HEALTH CHECK -------------------
-app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
-        message: 'LUCT Reporting System API is running',
-        timestamp: new Date().toISOString(),
-        security: {
-            rateLimiting: 'Active',
-            bcrypt: 'Enabled',
-            jwt: 'Active'
+    const sql = `
+        SELECT c.*, u.name as lecturer_name 
+        FROM courses c
+        LEFT JOIN enrollments e ON c.id = e.course_id
+        LEFT JOIN users u ON c.assigned_lecturer_id = u.id
+        WHERE e.student_id = ?
+        ORDER BY c.semester, c.course_code
+    `;
+    
+    db.query(sql, [req.user.id], (err, results) => {
+        if (err) {
+            console.error('❌ Student courses error:', err);
+            return res.status(500).json({ error: 'Server error' });
         }
+        res.json(results);
+    });
+});
+
+// Get student reports (reports for courses they're enrolled in)
+app.get('/api/student/reports', authenticateToken, (req, res) => {
+    if (req.user.role !== 'student') {
+        return res.status(403).json({ error: 'Access denied. Student role required.' });
+    }
+
+    const sql = `
+        SELECT r.*, c.course_name, c.course_code, u.name as lecturer_name, cl.class_name
+        FROM reports r
+        JOIN courses c ON r.course_id = c.id
+        JOIN enrollments e ON c.id = e.course_id
+        LEFT JOIN users u ON r.lecturer_id = u.id
+        LEFT JOIN classes cl ON r.class_id = cl.id
+        WHERE e.student_id = ?
+        ORDER BY r.date_of_lecture DESC
+    `;
+    
+    db.query(sql, [req.user.id], (err, results) => {
+        if (err) {
+            console.error('❌ Student reports error:', err);
+            return res.status(500).json({ error: 'Server error' });
+        }
+        res.json(results);
     });
 });
 
@@ -1005,4 +1020,12 @@ app.listen(PORT, () => {
     console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
     console.log(`🔑 Login endpoint: http://localhost:${PORT}/api/auth/login`);
     console.log(`🔐 Secure quick access: http://localhost:${PORT}/api/auth/secure-quick-access`);
+    console.log(`🎓 Student login: http://localhost:${PORT}/api/auth/student-login`);
+});
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+    console.log('🔄 Shutting down server gracefully...');
+    db.end();
+    process.exit(0);
 });
